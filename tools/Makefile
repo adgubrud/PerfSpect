@@ -325,7 +325,7 @@ perf-x86_64: linux-$(PERF_VERSION).tar.xz
 ifeq ("$(wildcard linux_perf)","")
 	tar -xf linux-$(PERF_VERSION).tar.xz --transform='s/linux-$(PERF_VERSION)/linux_perf/'
 endif
-	cd linux_perf/tools/perf && make LLVM_CONFIG="llvm-config --link-static" LDFLAGS="-static --static" BUILD_BPF_SKEL=1 NO_JVMTI=1 BUILD_NONDISTRO=1 LIBUNWIND=1 -j$(NPROC)
+	cd linux_perf/tools/perf && make LLVM_CONFIG="llvm-config --link-static" LDFLAGS="-static --static" BUILD_BPF_SKEL=1 NO_JVMTI=1 BUILD_NONDISTRO=1 LIBUNWIND=1 NO_LIBPFM4=1 -j$(NPROC)
 	mkdir -p bin/x86_64
 	cp linux_perf/tools/perf/perf bin/x86_64/
 	strip --strip-unneeded bin/x86_64/perf
