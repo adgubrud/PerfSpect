@@ -308,7 +308,7 @@ type eventEncoding struct {
 }
 
 // modifierRe matches encoding modifiers in metric event names, e.g. the ":c12" in
-// OFFMODULE_REQUESTS_OUTSTANDING.DATA_RD:c12 or ":u0x1e" in AMX_OPS_RETIRED.BF16:u0x1e:c1.
+// EVENT:c12 or ":u0x1e" in EVENT:u0x1e:c1.
 var modifierRe = regexp.MustCompile(`^(eq|c|e|i|u)(0x[0-9a-fA-F]+|[0-9]+)$`)
 
 // encodingWithModifiers returns the event's encoding with :c<n> (cmask), :e<n> (edge),
