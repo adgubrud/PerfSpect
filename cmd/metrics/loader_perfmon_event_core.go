@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -16,6 +18,7 @@ import (
 type CoreEvent struct {
 	EventCode          string `json:"EventCode"`
 	UMask              string `json:"UMask"`
+	UMaskExt           string `json:"UMaskExt"` // umask bits 8-15 (cpu format config:40-47)
 	EventName          string `json:"EventName"`
 	BriefDescription   string `json:"BriefDescription"`
 	PublicDescription  string `json:"PublicDescription"`
@@ -34,6 +37,8 @@ type CoreEvent struct {
 	L1HitIndication    string `json:"L1_Hit_Indication"`
 	Errata             string `json:"Errata"`
 	Offcore            string `json:"Offcore"`
+	Offmodule          string `json:"Offmodule"` // offmodule response-MSR events; programmed like Offcore
+	responseMSRTerm    string // cpu PMU format term for the response MSR; set by the loader
 	Deprecated         string `json:"Deprecated"`
 	PDISTCounter       string `json:"PDISTCounter"`
 	Speculative        string `json:"Speculative"`
@@ -105,12 +110,40 @@ func (event CoreEvent) IsEmpty() bool {
 	return event == CoreEvent{}
 }
 
+// UsesOffcoreMSR reports whether the event is programmed through an offcore response MSR,
+// i.e. an offcore or offmodule response event.
+func (event CoreEvent) UsesOffcoreMSR() bool {
+	return event.Offcore == "1" || event.Offmodule == "1"
+}
+
 func (event CoreEvent) IsCollectable(metadata Metadata) bool {
 	if !metadata.SupportsFixedTMA && (strings.HasPrefix(event.EventName, "TOPDOWN.SLOTS") || strings.HasPrefix(event.EventName, "PERF_METRICS")) && event.EventName != "TOPDOWN.SLOTS_P" {
 		slog.Debug("Fixed TMA events not supported", slog.String("event", event.EventName))
 		return false // TOPDOWN.SLOTS and PERF_METRICS.* events are not supported
 	}
-	if event.Offcore == "1" {
+	umask, err := event.perfUmask()
+	if err != nil {
+		slog.Warn("Event has an invalid umask encoding", slog.String("event", event.EventName), slog.String("error", err.Error()))
+		return false
+	}
+	if metadata.UMaskMax != 0 && umask != "" {
+		if v, err := strconv.ParseUint(umask, 0, 64); err == nil && v > metadata.UMaskMax {
+			slog.Debug("Event umask wider than the cpu PMU format", slog.String("event", event.EventName), slog.String("umask", umask))
+			return false
+		}
+	}
+	if len(metadata.PMUFormatFields) > 0 {
+		perfString, err := event.StringForPerf()
+		if err != nil {
+			slog.Warn("Event cannot be encoded for perf", slog.String("event", event.EventName), slog.String("error", err.Error()))
+			return false
+		}
+		if term := unsupportedPerfTerm(perfString, metadata.PMUFormatFields); term != "" {
+			slog.Debug("Event uses a term the cpu PMU format lacks", slog.String("event", event.EventName), slog.String("term", term))
+			return false
+		}
+	}
+	if event.UsesOffcoreMSR() {
 		if !metadata.SupportsOCR {
 			slog.Debug("Off-core response (OCR) events not supported", slog.String("event", event.EventName))
 			return false // Off-core response events are not supported
@@ -177,35 +210,138 @@ func (event CoreEvent) StringForPerf() (string, error) {
 		}
 		parts = append(parts, fmt.Sprintf("%s/event=%s", strings.ToLower(unit), eventCode))
 	}
-	// umask
-	if event.UMask != "" {
-		parts = append(parts, fmt.Sprintf("umask=%s", event.UMask))
+	enc, err := event.encodingWithModifiers()
+	if err != nil {
+		return "", err
+	}
+	umask, err := event.perfUmask()
+	if err != nil {
+		return "", err
+	}
+	if umask != "" {
+		parts = append(parts, fmt.Sprintf("umask=%s", umask))
 	}
 	// cmask
-	if event.CounterMask != "" {
-		cmask, err := strconv.ParseInt(event.CounterMask, 10, 64)
+	if enc.CounterMask != "" {
+		cmask, err := strconv.ParseInt(enc.CounterMask, 10, 64)
 		if err != nil {
-			return "", fmt.Errorf("error parsing CounterMask %s for event %s: %w", event.CounterMask, event.EventName, err)
+			return "", fmt.Errorf("error parsing CounterMask %s for event %s: %w", enc.CounterMask, event.EventName, err)
 		}
 		parts = append(parts, fmt.Sprintf("cmask=0x%02x", cmask))
+	}
+	// edge, inv, eq
+	for _, flag := range []struct{ name, value string }{{"edge", enc.EdgeDetect}, {"inv", enc.Invert}, {"eq", enc.equal}} {
+		if flag.value != "" && flag.value != "0" {
+			parts = append(parts, fmt.Sprintf("%s=%s", flag.name, flag.value))
+		}
 	}
 	//period
 	if event.SampleAfterValue != "" {
 		parts = append(parts, fmt.Sprintf("period=%s", event.SampleAfterValue))
 	}
 	// offcore_rsp, name
-	if event.Offcore == "1" {
+	if event.UsesOffcoreMSR() {
 		name, msr, err := customizeOCREventName(event)
 		if err != nil {
 			return "", fmt.Errorf("error customizing offcore event name %s: %w", event.EventName, err)
 		}
-		parts = append(parts, fmt.Sprintf("offcore_rsp=%s", msr))
+		term := event.responseMSRTerm
+		if term == "" {
+			term = "offcore_rsp"
+		}
+		parts = append(parts, fmt.Sprintf("%s=%s", term, msr))
 		parts = append(parts, fmt.Sprintf("name='%s'/", name))
 	} else {
 		// name
 		parts = append(parts, fmt.Sprintf("name='%s'/", event.EventName))
 	}
 	return strings.Join(parts, ","), nil
+}
+
+// unsupportedPerfTerm returns the first term in a "cpu/..../" perf event string that is
+// neither a cpu PMU format field nor a perf built-in term, or "" if there is none.
+func unsupportedPerfTerm(perfString string, formatFields []string) string {
+	body, isRawEvent := strings.CutPrefix(perfString, "cpu/")
+	if !isRawEvent {
+		return "" // a perf named event, e.g. "instructions" or "topdown-retiring"
+	}
+	body, _, _ = strings.Cut(body, ",name=") // name is last and may contain anything
+	for term := range strings.SplitSeq(strings.TrimSuffix(body, "/"), ",") {
+		key, _, _ := strings.Cut(term, "=")
+		if key == "period" || key == "name" || slices.Contains(formatFields, key) {
+			continue
+		}
+		return key
+	}
+	return ""
+}
+
+// perfUmask returns the umask perf is given for the event, "" if it has none.
+// Response-MSR events can list one umask per MSR ("0x01,0x02,0x04,0x08"); use the first,
+// the kernel reassigns the MSR when events in a group collide.
+func (event CoreEvent) perfUmask() (string, error) {
+	enc, err := event.encodingWithModifiers()
+	if err != nil || enc.UMask == "" {
+		return "", err
+	}
+	umask := strings.Split(enc.UMask, ",")[0]
+	if event.UMaskExt == "" {
+		return umask, nil
+	}
+	ext, err := strconv.ParseUint(event.UMaskExt, 0, 8)
+	if err != nil { // never drop the high byte silently; the event would count the wrong thing
+		return "", fmt.Errorf("error parsing UMaskExt %s for event %s: %w", event.UMaskExt, event.EventName, err)
+	}
+	if ext != 0 {
+		low, err := strconv.ParseUint(umask, 0, 8)
+		if err != nil {
+			return "", fmt.Errorf("error parsing UMask %s for event %s: %w", umask, event.EventName, err)
+		}
+		umask = fmt.Sprintf("0x%x", ext<<8|low)
+	}
+	return umask, nil
+}
+
+// eventEncoding holds the counter-control fields after name modifiers are applied.
+type eventEncoding struct {
+	UMask, CounterMask, EdgeDetect, Invert, equal string
+}
+
+// modifierRe matches encoding modifiers in metric event names, e.g. the ":c12" in
+// OFFMODULE_REQUESTS_OUTSTANDING.DATA_RD:c12 or ":u0x1e" in AMX_OPS_RETIRED.BF16:u0x1e:c1.
+var modifierRe = regexp.MustCompile(`^(eq|c|e|i|u)(0x[0-9a-fA-F]+|[0-9]+)$`)
+
+// encodingWithModifiers returns the event's encoding with :c<n> (cmask), :e<n> (edge),
+// :i<n> (invert), :eq<n> and :u<hex> (umask) name modifiers applied over the JSON values.
+func (event CoreEvent) encodingWithModifiers() (eventEncoding, error) {
+	enc := eventEncoding{UMask: event.UMask, CounterMask: event.CounterMask, EdgeDetect: event.EdgeDetect, Invert: event.Invert}
+	tokens := strings.Split(event.EventName, ":")
+	for _, token := range tokens[1:] {
+		m := modifierRe.FindStringSubmatch(token)
+		if m == nil {
+			continue // not an encoding modifier, e.g. SUP, perf_metrics, ocr_msr_val=...
+		}
+		switch m[1] {
+		case "c":
+			enc.CounterMask = m[2]
+		case "e":
+			enc.EdgeDetect = m[2]
+		case "i":
+			enc.Invert = m[2]
+		case "eq":
+			enc.equal = m[2]
+		case "u":
+			enc.UMask = m[2]
+		}
+	}
+	if strings.HasPrefix(enc.CounterMask, "0x") {
+		v, err := strconv.ParseInt(enc.CounterMask[2:], 16, 64)
+		if err != nil {
+			return enc, fmt.Errorf("error parsing cmask modifier for event %s: %w", event.EventName, err)
+		}
+		enc.CounterMask = strconv.FormatInt(v, 10)
+	}
+	return enc, nil
 }
 
 // some offcore events have a MSR value appended to their name, like this:

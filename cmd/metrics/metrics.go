@@ -1101,6 +1101,7 @@ func runCmd(cmd *cobra.Command, args []string) error {
 				exists, _ := util.FileExists(csvMetricsFile)
 				if !exists {
 					_ = multiSpinner.Status(targetContext.target.GetName(), "no metrics collected")
+					exitErrs = append(exitErrs, fmt.Errorf("no metrics collected on target %s, see the log file for details", targetContext.target.GetName()))
 				} else {
 					targetContext.metadata.PerfSpectVersion = appContext.Version
 					summaryFiles, err := summarizeMetrics(localOutputDir, targetContext.target.GetName(), targetContext.metadata, targetContext.metricDefinitions)

@@ -53,6 +53,7 @@ const (
 	scriptARMCPUID               = "arm cpuid"
 	scriptPerfStatAMDUncoreProbe = "perf stat amd uncore probe"
 	scriptPMUEnumerationSafety   = "pmu enumeration safety"
+	scriptCPUPMUFormat           = "cpu pmu format"
 )
 
 // Checks whether fixed purpose counters are exposed and that the slots event is exposed
@@ -146,6 +147,10 @@ type X86Metadata struct {
 	SupportsUncore            bool
 	SupportsPEBS              bool
 	SupportsOCR               bool
+	PMUName                   string   // cpu PMU caps/pmu_name, e.g. "generic_arch_v5+" in fallback mode
+	UMaskMax                  uint64   // largest umask the cpu PMU format can encode; 0 if unknown
+	OffcoreResponseTerm       string   // cpu PMU format term for the response MSR; "" if none
+	PMUFormatFields           []string // cpu PMU format field names, e.g. "umask", "eq"; nil if unknown
 	TSC                       int
 	TSCFrequencyHz            int
 }
@@ -351,6 +356,11 @@ BEGIN {
 		ScriptTemplate: "uname -r",
 	},
 	{
+		Name:           scriptCPUPMUFormat,
+		ScriptTemplate: cpuPMUFormatScript,
+		Architectures:  []string{cpus.X86Architecture},
+	},
+	{
 		Name:           scriptARMSlots,
 		ScriptTemplate: "cat /sys/bus/event_source/devices/armv8_pmuv3_0/caps/slots",
 		Architectures:  []string{cpus.ARMArchitecture},
@@ -362,12 +372,43 @@ BEGIN {
 	},
 }
 
+// uarchScriptOverrides maps a microarchitecture to replacement templates for named metadata
+// scripts, for uarchs whose base scripts don't work, e.g., perf has no event table for them.
+var uarchScriptOverrides = map[string]map[string]string{
+	// TODO: revisit once PERF_VERSION has DMR pmu-events; the TMA and PEBS overrides can go,
+	// but OCR still needs one because DMR names the event OMR.
+	cpus.UarchDMR: {
+		scriptPerfStatTMA:  "perf stat -a -e '{slots,topdown-bad-spec}' sleep 1",
+		scriptPerfStatPEBS: "perf stat -a -e 'cpu/event=0xad,umask=0x40,name=INT_MISC.UNKNOWN_BRANCH_CYCLES/' sleep 1",
+		// v7.3+ kernels renamed the DMR term offcore_rsp to offmodule_rsp
+		scriptPerfStatOCR: `term=offcore_rsp
+[[ -e /sys/bus/event_source/devices/cpu/format/offmodule_rsp ]] && term=offmodule_rsp
+perf stat -a -e "cpu/event=0x2a,umask=0x01,${term}=0x4000000000004477,name=OMR.READS_TO_CORE.ANY_RESPONSE/" sleep 1`,
+	},
+}
+
+// scriptTemplateOverride returns the uarch's replacement template for the named script, if any.
+func scriptTemplateOverride(uarch, scriptName string) (template string, hasOverride bool) {
+	template, hasOverride = uarchScriptOverrides[uarch][scriptName]
+	return template, hasOverride
+}
+
+// cpuPMUFormatScript prints the core PMU's name and format fields, i.e. which event
+// encodings the kernel accepts. Guests and kernels that don't know the CPU expose less.
+const cpuPMUFormatScript = `dir=/sys/bus/event_source/devices/cpu
+[[ -d "$dir" ]] || dir=/sys/bus/event_source/devices/cpu_core
+echo "pmu_name=$(cat "$dir/caps/pmu_name" 2>/dev/null)"
+for f in "$dir"/format/*; do
+	[[ -f "$f" ]] && echo "format.${f##*/}=$(cat "$f")"
+done
+`
+
 // getMetadataScripts returns the list of scripts to run for metadata collection.
 // It copies the base definitions and applies template replacements and privilege settings.
 //
 // enumerateEventsFromSysfs replaces the two 'perf list --json' scripts with sysfs reads,
 // for targets where letting perf enumerate events would fault the kernel.
-func getMetadataScripts(noRoot bool, noSystemSummary bool, numGPCounters int, enumerateEventsFromSysfs bool) ([]script.ScriptDefinition, error) {
+func getMetadataScripts(noRoot bool, noSystemSummary bool, numGPCounters int, enumerateEventsFromSysfs bool, uarch string) ([]script.ScriptDefinition, error) {
 	metadataScripts := make([]script.ScriptDefinition, 0, len(baseMetadataScripts))
 
 	// Copy base scripts and apply settings
@@ -384,6 +425,10 @@ func getMetadataScripts(noRoot bool, noSystemSummary bool, numGPCounters int, en
 				scriptDef.ScriptTemplate = sysfsAllSupportedEventsScript
 				scriptDef.Depends = nil
 			}
+		}
+
+		if template, hasOverride := scriptTemplateOverride(uarch, scriptDef.Name); hasOverride {
+			scriptDef.ScriptTemplate = template
 		}
 
 		// Apply template replacements for fixed counter scripts
@@ -656,7 +701,7 @@ func getNumGPCounters(uarch string) (numGPCounters int, err error) {
 	switch shortUarch {
 	case cpus.UarchBDX, cpus.UarchSKX, cpus.UarchCLX:
 		numGPCounters = 4
-	case cpus.UarchICX, cpus.UarchSPR, cpus.UarchEMR, cpus.UarchSRF, cpus.UarchCWF, cpus.UarchGNR:
+	case cpus.UarchICX, cpus.UarchSPR, cpus.UarchEMR, cpus.UarchSRF, cpus.UarchCWF, cpus.UarchGNR, cpus.UarchDMR:
 		numGPCounters = 8
 	case "Gen", "Ber", "Tur":
 		numGPCounters = 5

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"perfspect/internal/cpus"
 	"perfspect/internal/util"
 	"regexp"
 	"slices"
@@ -82,6 +83,9 @@ func (l *PerfmonLoader) Load(loaderConfig LoaderConfig) ([]MetricDefinition, []G
 	coreEvents, err := NewCoreEvents(config.PerfmonCoreEventsFile)
 	if err != nil {
 		return nil, nil, fmt.Errorf("error loading perfmon core events: %w", err)
+	}
+	for i := range coreEvents.Events {
+		coreEvents.Events[i].responseMSRTerm = loaderConfig.Metadata.OffcoreResponseTerm
 	}
 	// Load the perfmon uncore events from the JSON file
 	uncoreEvents, err := NewUncoreEvents(config.PerfmonUncoreEventsFile)
@@ -164,6 +168,7 @@ func (l *PerfmonLoader) Load(loaderConfig LoaderConfig) ([]MetricDefinition, []G
 	for _, group := range otherGroups {
 		allGroups = append(allGroups, group.ToGroupDefinition())
 	}
+	metricDefs, allGroups = metricsAndGroupsOverride(loaderConfig.Metadata.Microarchitecture, metricDefs, allGroups)
 	// Replace retire latencies variables with their values
 	if config.PerfmonRetireLatencyFile != "" {
 		metricDefs, err = replaceRetireLatencies(metricDefs, config.PerfmonRetireLatencyFile)
@@ -177,6 +182,37 @@ func (l *PerfmonLoader) Load(loaderConfig LoaderConfig) ([]MetricDefinition, []G
 		return nil, nil, fmt.Errorf("failed to configure metrics: %w", err)
 	}
 	return metricDefs, allGroups, nil
+}
+
+// metricsAndGroupsOverrides maps a microarchitecture to a fix-up applied to its loaded metrics
+// and groups, for uarchs whose events perf can't resolve by name.
+var metricsAndGroupsOverrides = map[string]func([]MetricDefinition, []GroupDefinition) ([]MetricDefinition, []GroupDefinition){
+	// TODO: remove once PERF_VERSION has DMR pmu-events and perf resolves topdown.slots
+	cpus.UarchDMR: useKernelSlotsEventName,
+}
+
+// metricsAndGroupsOverride applies the uarch's fix-up, if any, to the metrics and groups.
+func metricsAndGroupsOverride(uarch string, metricDefs []MetricDefinition, groups []GroupDefinition) ([]MetricDefinition, []GroupDefinition) {
+	if override, hasOverride := metricsAndGroupsOverrides[uarch]; hasOverride {
+		return override(metricDefs, groups)
+	}
+	return metricDefs, groups
+}
+
+// useKernelSlotsEventName swaps perf's "topdown.slots" alias for the kernel's "slots" event,
+// for uarchs that perf has no event name table for.
+func useKernelSlotsEventName(metricDefs []MetricDefinition, groups []GroupDefinition) ([]MetricDefinition, []GroupDefinition) {
+	for i := range metricDefs {
+		metricDefs[i].Expression = strings.ReplaceAll(metricDefs[i].Expression, "[topdown.slots]", "[slots]")
+	}
+	for _, group := range groups {
+		for j := range group {
+			if group[j].Raw == "topdown.slots" {
+				group[j].Raw = "slots"
+			}
+		}
+	}
+	return metricDefs, groups
 }
 
 // uarchToResourceName maps from the CPU's microarchitecture, as defined in the cpus
@@ -466,6 +502,9 @@ func getUncollectableEvents(eventNames []string, coreEvents CoreEvents, uncoreEv
 	for _, eventName := range eventNames {
 		coreEvent := coreEvents.FindEventByName(eventName)
 		if !coreEvent.IsEmpty() {
+			if strings.Contains(eventName, ":") {
+				coreEvent.EventName = eventName // check with modifiers (:c, :eq, :u...), as groupsFromEventNames builds it
+			}
 			if !coreEvent.IsCollectable(metadata) {
 				uncollectableEvents = util.UniqueAppend(uncollectableEvents, coreEvent.EventName)
 			}

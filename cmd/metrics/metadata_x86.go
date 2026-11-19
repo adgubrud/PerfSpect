@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -18,6 +19,7 @@ import (
 	"perfspect/internal/progress"
 	"perfspect/internal/script"
 	"perfspect/internal/target"
+	"perfspect/internal/util"
 )
 
 // X86MetadataCollector handles Intel/AMD x86_64 metadata collection.
@@ -102,7 +104,7 @@ func (c *X86MetadataCollector) CollectMetadata(t target.Target, noRoot bool, noS
 	}
 
 	// Run metadata scripts concurrently
-	metadataScripts, err := getMetadataScripts(noRoot, noSystemSummary, metadata.NumGeneralPurposeCounters, enumerateEventsFromSysfs)
+	metadataScripts, err := getMetadataScripts(noRoot, noSystemSummary, metadata.NumGeneralPurposeCounters, enumerateEventsFromSysfs, metadata.Microarchitecture)
 	if err != nil {
 		return Metadata{}, fmt.Errorf("failed to get metadata scripts: %v", err)
 	}
@@ -235,13 +237,90 @@ func (c *X86MetadataCollector) detectEventSupport(metadata *Metadata, scriptOutp
 		slog.Warn("'OCR' events not supported", slog.String("output", output))
 	}
 
+	// Event encodings the core PMU accepts
+	format, err := parseCPUPMUFormat(scriptOutputs[scriptCPUPMUFormat].Stdout)
+	if err != nil {
+		slog.Warn("failed to parse cpu PMU format, not filtering events by encoding", slog.String("error", err.Error()))
+		return nil
+	}
+	metadata.PMUName, metadata.UMaskMax, metadata.OffcoreResponseTerm = format.pmuName, format.umaskMax, format.offcoreTerm
+	metadata.PMUFormatFields = format.fields
+	if strings.HasPrefix(metadata.PMUName, "generic_arch") {
+		slog.Warn("the kernel exposes only the architectural PMU, because it does not recognize this CPU "+
+			"or the target is a guest with a restricted PMU; model-specific events, TMA, OCR and uncore "+
+			"metrics are unavailable", slog.String("pmu_name", metadata.PMUName))
+	}
+	if len(format.fields) > 0 && metadata.OffcoreResponseTerm == "" && metadata.SupportsOCR {
+		slog.Warn("'OCR' events not supported, cpu PMU format has no offcore response term")
+		metadata.SupportsOCR = false
+	}
 	return nil
+}
+
+// cpuPMUFormat is the parsed output of cpuPMUFormatScript.
+type cpuPMUFormat struct {
+	pmuName     string
+	umaskMax    uint64   // 0 if the format has no umask field
+	offcoreTerm string   // "offcore_rsp", "offmodule_rsp", or ""
+	fields      []string // format field names; empty means the format is unknown
+}
+
+// parseCPUPMUFormat parses "pmu_name=<name>" and "format.<field>=<spec>" lines.
+func parseCPUPMUFormat(output string) (format cpuPMUFormat, err error) {
+	for line := range strings.SplitSeq(output, "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok {
+			continue
+		}
+		if key == "pmu_name" {
+			format.pmuName = value
+			continue
+		}
+		field, ok := strings.CutPrefix(key, "format.")
+		if !ok {
+			continue
+		}
+		format.fields = append(format.fields, field)
+		switch field {
+		case "umask":
+			bits, err := formatFieldWidth(value)
+			if err != nil {
+				return cpuPMUFormat{}, fmt.Errorf("umask format %q: %w", value, err)
+			}
+			if format.umaskMax, err = util.Uint64FromNumLowerBits(bits); err != nil {
+				return cpuPMUFormat{}, fmt.Errorf("umask format %q: %w", value, err)
+			}
+		case "offmodule_rsp":
+			format.offcoreTerm = field // the newer name wins if both exist
+		case "offcore_rsp":
+			if format.offcoreTerm == "" {
+				format.offcoreTerm = field
+			}
+		}
+	}
+	return format, nil
+}
+
+// formatFieldWidth returns the number of bits in a PMU format spec like "config:8-15,40-47".
+func formatFieldWidth(spec string) (int, error) {
+	_, ranges, ok := strings.Cut(spec, ":")
+	if !ok {
+		return 0, fmt.Errorf("missing ':'")
+	}
+	bits, err := util.SelectiveIntRangeToIntList(ranges)
+	if err != nil {
+		return 0, err
+	}
+	if slices.Max(bits) > 63 {
+		return 0, fmt.Errorf("bit position beyond 63 in %q", ranges)
+	}
+	return len(bits), nil
 }
 
 // checkUncoreSupport determines if uncore events are supported based on detected devices.
 func (c *X86MetadataCollector) checkUncoreSupport(uncoreDeviceIDs map[string][]int, isAMD bool) bool {
 	for uncoreDeviceName := range uncoreDeviceIDs {
-		if !isAMD && uncoreDeviceName == "cha" {
+		if !isAMD && (uncoreDeviceName == "cha" || uncoreDeviceName == "cbo") { // newer Intel arch has cbo, not cha
 			return true
 		} else if isAMD && (uncoreDeviceName == "l3" || uncoreDeviceName == "df") {
 			return true
@@ -373,7 +452,7 @@ func getSupportsFixedTMA(scriptOutputs map[string]script.ScriptOutput) (supporte
 	// event values being zero or equal to each other indicates these events are not (properly) supported
 	vals := make(map[string]float64)
 	lines := strings.Split(output, "\n")
-	re := regexp.MustCompile(`^\s*([0-9]+)\s+(topdown[\w.\-]+)`)
+	re := regexp.MustCompile(`^\s*([0-9]+)\s+(topdown[\w.\-]+|slots)`)
 	for _, line := range lines {
 		// count may include commas as thousands separators, remove them
 		line = strings.ReplaceAll(line, ",", "")
@@ -387,6 +466,9 @@ func getSupportsFixedTMA(scriptOutputs map[string]script.ScriptOutput) (supporte
 		}
 	}
 	topDownSlots := vals["topdown.slots"]
+	if _, ok := vals["slots"]; ok { // DMR probe uses the kernel event name
+		topDownSlots = vals["slots"]
+	}
 	badSpeculation := vals["topdown-bad-spec"]
 	supported = topDownSlots != badSpeculation && topDownSlots != 0 && badSpeculation != 0
 	return

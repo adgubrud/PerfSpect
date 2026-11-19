@@ -173,10 +173,10 @@ func (group *CoreGroup) AddEvent(event CoreEvent, reorder bool, metadata Metadat
 		return fmt.Errorf("group already has an event tagged with TakenAlone, cannot add %s", event.EventName)
 	}
 	// only 2 offcore events are allowed in a group
-	if event.Offcore == "1" {
+	if event.UsesOffcoreMSR() {
 		offcoreCount := 0
 		for _, existingEvent := range group.GeneralPurposeCounters {
-			if existingEvent.Offcore == "1" {
+			if existingEvent.UsesOffcoreMSR() {
 				offcoreCount++
 			}
 		}
